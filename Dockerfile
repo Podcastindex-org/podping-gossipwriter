@@ -1,0 +1,33 @@
+FROM rust:latest AS builder
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl-dev libzmq3-dev capnproto pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock /src/
+COPY dtt /src/dtt
+COPY gossip-writer /src/gossip-writer
+
+RUN cargo build --release -p gossip-writer
+
+FROM debian:trixie-slim AS runner
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl libzmq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /data/gossip /opt/gossip-writer \
+    && chown -R 1000:1000 /data /opt/gossip-writer
+
+WORKDIR /opt/gossip-writer
+COPY --from=builder /src/target/release/gossip-writer /opt/gossip-writer/gossip-writer
+
+USER 1000
+
+ENTRYPOINT ["/opt/gossip-writer/gossip-writer"]
