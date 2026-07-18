@@ -12,7 +12,7 @@ COPY Cargo.toml Cargo.lock /src/
 COPY dtt /src/dtt
 COPY gossip-writer /src/gossip-writer
 
-RUN cargo build --release -p gossip-writer
+RUN cargo build --release --locked -p gossip-writer
 
 FROM debian:trixie-slim AS runner
 

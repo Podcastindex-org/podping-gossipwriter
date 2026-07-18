@@ -15,8 +15,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
       - name: Clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace --locked
       - name: Build
-        run: cargo build -p gossip-writer
+        run: cargo build -p gossip-writer --locked
+      - name: Docker build
+        run: docker build -t podping-gossipwriter-ci .
