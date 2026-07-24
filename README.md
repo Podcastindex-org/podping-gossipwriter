@@ -39,7 +39,7 @@ Docker:
 | `ARCHIVE_ENABLED` | `false` | enable SQLite archive (`1`/`true`/`yes`) |
 | `ARCHIVE_PATH` | `/data/gossip/archive.db` | SQLite archive location |
 | `KNOWN_PEERS_FILE` | `/data/gossip/known_peers.txt` | cached peer list (max 15) |
-| `BOOTSTRAP_PEER_IDS` | (empty) | comma-separated iroh node IDs to bootstrap from |
+| `BOOTSTRAP_PEER_IDS` | 5 podping.cloud writer nodes | comma-separated iroh node IDs to bootstrap from, alongside DHT discovery. Defaults to the stable podping.cloud writer nodes; set your own list to override, or an empty string for DHT-only |
 | `DHT_INITIAL_SECRET` | `podping_gossip_default_secret` | DHT topic-discovery secret |
 | `TRUSTED_PUBLISHERS_FILE` | `/data/gossip/trusted_publishers.txt` | pubkeys whose messages peers trust |
 | `TRUSTED_MONITORS_FILE` | `trusted_monitors.txt` | pubkeys allowed monitor access |
