@@ -356,6 +356,8 @@ const BATCH_INTERVAL_SECS: u64 = 3;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3;
+const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 10; // Cap on old gossip actor shutdown during reconnect
+const RECONNECT_JOIN_TIMEOUT_SECS: u64 = 60;     // Cap on DHT re-join during reconnect; a hung join must not wedge the broadcast task
 const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
 const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
 
@@ -394,8 +396,14 @@ async fn reconnect_gossip_topic(
     old_gossip: &Gossip,
 ) -> Result<(DttGossipSender, DttGossipReceiver, Router, Gossip), Box<dyn std::error::Error + Send + Sync>>
 {
-    // Shut down the old Gossip actor so all its internal dtt actors stop
-    let _ = old_gossip.shutdown().await;
+    // Shut down the old Gossip actor so all its internal dtt actors stop.
+    // Time-capped: a hung actor must not block the reconnect (the actor is
+    // abandoned either way once the new Gossip replaces it).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_SHUTDOWN_TIMEOUT_SECS),
+        old_gossip.shutdown(),
+    )
+    .await;
 
     let new_gossip = Gossip::builder()
         .max_message_size(65536)
@@ -413,8 +421,22 @@ async fn reconnect_gossip_topic(
         None,
         dht_initial_secret.into_bytes(),
     );
-    let new_topic = new_gossip.subscribe_and_join_bootstrap_only(publisher).await?;
-    let (new_sender, new_receiver) = new_topic.split().await?;
+    // Time-capped: subscribe_and_join_bootstrap_only awaits DHT bootstrap and
+    // can hang indefinitely; without this cap a wedged join freezes the entire
+    // broadcast select loop (observed in production: 90+ min stall, sent=0
+    // failed=0, queue backing up). On timeout the caller's existing error path
+    // retries after the next stall or broadcast failure.
+    let join_result = tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_JOIN_TIMEOUT_SECS),
+        async {
+            let new_topic = new_gossip.subscribe_and_join_bootstrap_only(publisher).await?;
+            let pair = new_topic.split().await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(pair)
+        },
+    )
+    .await
+    .map_err(|_| format!("gossip re-join timed out after {}s", RECONNECT_JOIN_TIMEOUT_SECS))?;
+    let (new_sender, new_receiver) = join_result?;
 
     Ok((new_sender, new_receiver, new_router, new_gossip))
 }
