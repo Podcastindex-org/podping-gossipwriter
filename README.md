@@ -14,10 +14,15 @@ Hive writes are unaffected.
 ## Provenance
 
 Extracted 2026-07 from [Podcastindex-org/podping.alpha](https://github.com/Podcastindex-org/podping.alpha),
-where the R&D history lives. `dtt/` vendors a fork of
-[distributed-topic-tracker](https://github.com/rustonbsd/distributed-topic-tracker) 0.2.8
-(MIT, by Zacharias Boehler) with local modifications for peer-management and
-memory behavior.
+where the R&D history lives.
+
+## Peer discovery
+
+No DHT is used. Peer discovery is seed-based: 5 compiled-in podping.cloud
+writer node IDs (overridable via `BOOTSTRAP_PEER_IDS`), persisted to
+`KNOWN_PEERS_FILE` (capped at 15 entries) as new peers are seen, plus
+periodic `PeerAnnounce` gossip messages that let already-connected peers
+learn about each other.
 
 ## Build
 
@@ -39,8 +44,7 @@ Docker:
 | `ARCHIVE_ENABLED` | `false` | enable SQLite archive (`1`/`true`/`yes`) |
 | `ARCHIVE_PATH` | `/data/gossip/archive.db` | SQLite archive location |
 | `KNOWN_PEERS_FILE` | `/data/gossip/known_peers.txt` | cached peer list (max 15) |
-| `BOOTSTRAP_PEER_IDS` | 5 podping.cloud writer nodes | comma-separated iroh node IDs to bootstrap from, alongside DHT discovery. Defaults to the stable podping.cloud writer nodes; set your own list to override, or an empty string for DHT-only |
-| `DHT_INITIAL_SECRET` | `podping_gossip_default_secret` | DHT topic-discovery secret |
+| `BOOTSTRAP_PEER_IDS` | 5 podping.cloud writer nodes | comma-separated iroh node IDs to bootstrap from. Defaults to the stable podping.cloud writer nodes; set your own list to override, or an empty string to rely solely on `KNOWN_PEERS_FILE` and inbound connections |
 | `TRUSTED_PUBLISHERS_FILE` | `/data/gossip/trusted_publishers.txt` | pubkeys whose messages peers trust |
 | `TRUSTED_MONITORS_FILE` | `trusted_monitors.txt` | pubkeys allowed monitor access |
 | `NODE_FRIENDLY_NAME` | (none) | human-readable name in PeerAnnounce |

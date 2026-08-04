@@ -9,7 +9,6 @@ RUN apt-get update \
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock /src/
-COPY dtt /src/dtt
 COPY gossip-writer /src/gossip-writer
 
 RUN cargo build --release --locked -p gossip-writer
