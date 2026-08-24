@@ -1,4 +1,5 @@
 mod archive;
+mod memwatch;
 mod notification;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -365,22 +366,6 @@ const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3;
 const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 10; // Cap on old gossip actor shutdown during reconnect
 const RECONNECT_JOIN_TIMEOUT_SECS: u64 = 60;     // Cap on gossip re-join during reconnect; a hung join must not wedge the broadcast task
 const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
-const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
-
-/// Read process resident set size in bytes. Returns 0 on non-Linux or read failure.
-fn read_rss_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
-                return pages * 4096;
-            }
-        }
-        0
-    }
-    #[cfg(not(target_os = "linux"))]
-    { 0 }
-}
 const MAX_RETRY_QUEUE: usize = 500;
 const MAX_GOSSIP_PAYLOAD: usize = 60000; // Must stay under max_message_size (65536) with overhead
 const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
@@ -644,6 +629,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Shutdown flag for the blocking ZMQ thread ---
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_zmq = shutdown.clone();
+
+    // --- Adaptive memory watchdog (iroh #4390 leak mitigation) ---
+    if memwatch::enabled() {
+        let (thresholds, source) = memwatch::thresholds_from_env();
+        let restarts = memwatch::restart_count();
+        println!(
+            "  Memory watchdog: soft {}MB (endpoint recycle) / hard {}MB (self-restart) — {}{}",
+            thresholds.soft / (1024 * 1024),
+            thresholds.hard / (1024 * 1024),
+            source,
+            if restarts > 0 { format!("; watchdog restarts so far: {}", restarts) } else { String::new() },
+        );
+        memwatch::spawn(
+            thresholds,
+            force_endpoint_reset.clone(),
+            reconnect_requested.clone(),
+            reconnect_notify.clone(),
+            shutdown.clone(),
+        );
+    } else {
+        println!("  Memory watchdog: disabled (PODPING_MEMWATCH=off)");
+    }
 
     // --- Re-bootstrap watchdog timer ---
     let now_secs = SystemTime::now()
@@ -1268,7 +1275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let delta_sent = sent - prev_sent;
                 let delta_failed = failed - prev_failed;
                 let queue_len = h_tx.max_capacity() - h_tx.capacity();
-                let rss_bytes = read_rss_bytes();
+                let rss_bytes = memwatch::read_rss_bytes();
 
                 let status = if !alive {
                     "\x1b[1;31mBROADCAST TASK DEAD\x1b[0m"
@@ -1285,15 +1292,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     status, delta_sent, delta_failed, queue_len, since_last, rss_bytes / 1_048_576,
                 );
 
-                // Memory-bounded endpoint recycle: time-based (12h) + RSS-ceiling safety valve
-                let time_elapsed = last_reset.elapsed() >= std::time::Duration::from_secs(PERIODIC_RESET_INTERVAL_SECS);
-                let rss_exceeded = rss_bytes > RSS_CEILING_BYTES;
-                if time_elapsed || rss_exceeded {
-                    let reason = if rss_exceeded {
-                        format!("RSS {}MB exceeds ceiling {}MB", rss_bytes / 1_048_576, RSS_CEILING_BYTES / 1_048_576)
-                    } else {
-                        format!("{}h elapsed since last reset", last_reset.elapsed().as_secs() / 3600)
-                    };
+                // Time-based periodic endpoint recycle (RSS ceilings live in memwatch)
+                if last_reset.elapsed() >= std::time::Duration::from_secs(PERIODIC_RESET_INTERVAL_SECS) {
+                    let reason = format!("{}h elapsed since last reset", last_reset.elapsed().as_secs() / 3600);
                     eprintln!("\x1b[1;35m[HEALTH] Triggering endpoint reset — {}\x1b[0m", reason);
                     h_force_reset.store(true, Ordering::Relaxed);
                     h_reconnect_requested.store(true, Ordering::Relaxed);
