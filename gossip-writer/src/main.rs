@@ -79,6 +79,16 @@ struct PeerAnnounce {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     build_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    iroh_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog_restarts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_resets: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neighbors_direct: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neighbors_relayed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     neighbors: Option<Vec<String>>,
 }
 
@@ -91,6 +101,9 @@ struct AnnounceMetrics {
     msgs_sent: Option<u64>,
     last_msg_age_secs: Option<u64>,
     reconnect_count: Option<u64>,
+    endpoint_resets: Option<u64>,
+    neighbors_direct: Option<u32>,
+    neighbors_relayed: Option<u32>,
 }
 
 // Canonical form for peer_endorse signing (alphabetical by serialized key name)
@@ -191,6 +204,11 @@ impl PeerAnnounce {
             os: Some(std::env::consts::OS.to_string()),
             arch: Some(std::env::consts::ARCH.to_string()),
             build_type: Some(if cfg!(debug_assertions) { "debug" } else { "release" }.to_string()),
+            iroh_version: option_env!("IROH_VERSION").map(str::to_string),
+            watchdog_restarts: Some(memwatch::restart_count()),
+            endpoint_resets: metrics.endpoint_resets,
+            neighbors_direct: metrics.neighbors_direct,
+            neighbors_relayed: metrics.neighbors_relayed,
             neighbors: metrics.neighbors,
         }
     }
@@ -227,6 +245,11 @@ impl PeerAnnounce {
             os: None,
             arch: None,
             build_type: None,
+            iroh_version: None,
+            watchdog_restarts: None,
+            endpoint_resets: None,
+            neighbors_direct: None,
+            neighbors_relayed: None,
             neighbors: None,
         }
     }
@@ -382,6 +405,39 @@ struct PendingPing {
     reason_str: &'static str,
     medium_raw: u16,
     reason_raw: u16,
+}
+
+/// Classify current gossip neighbors by how we reach them: any active IP path
+/// counts as direct; active relay paths only counts as relayed. Neighbors with
+/// no known transport info are left uncounted.
+async fn classify_neighbor_paths(endpoint: &iroh::Endpoint, neighbor_ids: &[String]) -> (u32, u32) {
+    let mut direct = 0u32;
+    let mut relayed = 0u32;
+    for id_str in neighbor_ids {
+        let Ok(id) = id_str.parse::<iroh::EndpointId>() else {
+            continue;
+        };
+        let Some(info) = endpoint.remote_info(id).await else {
+            continue;
+        };
+        let mut has_ip = false;
+        let mut has_relay = false;
+        for addr in info.addrs() {
+            if matches!(addr.usage(), iroh::endpoint::TransportAddrUsage::Active) {
+                match addr.addr() {
+                    iroh::TransportAddr::Ip(_) => has_ip = true,
+                    iroh::TransportAddr::Relay(_) => has_relay = true,
+                    _ => {}
+                }
+            }
+        }
+        if has_ip {
+            direct += 1;
+        } else if has_relay {
+            relayed += 1;
+        }
+    }
+    (direct, relayed)
 }
 
 async fn reconnect_gossip_topic(
@@ -582,8 +638,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- Set up Iroh endpoint and gossip ---
-    // Load or create a persistent iroh node key (separate from the ed25519-dalek signing key)
-    let node_key = load_or_create_node_key(&node_key_file)?;
+    // Load or create a persistent iroh node key (separate from the ed25519-dalek signing key).
+    // GOSSIP_KEY_SEED derives the key deterministically instead, for hosts with no
+    // persistent storage (e.g. k8s pods) — same seed+discriminator, same identity.
+    let node_key = match env::var("GOSSIP_KEY_SEED").ok().filter(|s| !s.trim().is_empty()) {
+        Some(seed) => {
+            let disc = choose_discriminator(
+                env::var("GOSSIP_KEY_DISCRIMINATOR").ok(),
+                env::var("HOSTNAME").ok(),
+                fs::read_to_string("/proc/sys/kernel/hostname").ok(),
+            )
+            .ok_or("GOSSIP_KEY_SEED is set but no discriminator found; set GOSSIP_KEY_DISCRIMINATOR (or HOSTNAME)")?;
+            println!("  Deriving node key from GOSSIP_KEY_SEED (discriminator: {})", disc);
+            SecretKey::from_bytes(&derive_key_from_seed(&seed, &disc))
+        }
+        None => load_or_create_node_key(&node_key_file)?,
+    };
     let node_key_bytes = node_key.to_bytes();
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(node_key)
@@ -665,7 +735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_receive_generation = receive_generation.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Peer friendly name tracking
-    let peer_names: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    let peer_names: Arc<RwLock<HashMap<String, PeerNameEntry>>> = Arc::new(RwLock::new(HashMap::new()));
 
     // Health tracking counters
     let health_broadcasts_sent = Arc::new(AtomicU64::new(0));
@@ -673,6 +743,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_last_broadcast_ok = Arc::new(AtomicU64::new(now_secs));
     let health_broadcast_task_alive = Arc::new(AtomicBool::new(true));
     let reconnect_count_counter = Arc::new(AtomicU64::new(0));
+    let endpoint_reset_count = Arc::new(AtomicU64::new(0));
+    // Current endpoint handle, replaced by the reconnect task on endpoint recycles
+    // so the announce task can query path info on the live endpoint
+    let shared_endpoint: Arc<tokio::sync::RwLock<iroh::Endpoint>> =
+        Arc::new(tokio::sync::RwLock::new(endpoint.clone()));
     let msgs_received_counter = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
     let neighbor_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -722,6 +797,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_neighbor_ids = neighbor_ids.clone();
     let bcast_unique_sources = unique_sources.clone();
     let reconnect_endpoint = endpoint.clone();
+    let bcast_endpoint_resets = endpoint_reset_count.clone();
+    let bcast_shared_endpoint = shared_endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
     let reconnect_bootstrap_ids = bootstrap_peer_ids_str.clone();
     let reconnect_peers_file = peers_file.clone();
@@ -777,6 +854,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tokio::time::timeout(std::time::Duration::from_secs(5), old_ep.close()).await.ok();
                             });
                             _current_endpoint = new_ep;
+                            bcast_endpoint_resets.fetch_add(1, Ordering::Relaxed);
+                            *bcast_shared_endpoint.write().await = _current_endpoint.clone();
                         }
                     }
                     eprintln!("\x1b[1;31m[RECONNECT] Watchdog requested full reconnect (attempt {})...\x1b[0m", consecutive_reconnects);
@@ -917,6 +996,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tokio::time::timeout(std::time::Duration::from_secs(5), old_ep.close()).await.ok();
                                 });
                                 _current_endpoint = new_ep;
+                                bcast_endpoint_resets.fetch_add(1, Ordering::Relaxed);
+                                *bcast_shared_endpoint.write().await = _current_endpoint.clone();
                             }
                         }
                         eprintln!("\x1b[1;31m[RECONNECT] {} broadcast failures — reconnecting (attempt {})...\x1b[0m", RECONNECT_AFTER_FAILURES, consecutive_reconnects);
@@ -1018,19 +1099,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let announce_reconnects = reconnect_count_counter.clone();
         let announce_neighbors = neighbor_count.clone();
         let announce_neighbor_ids = neighbor_ids.clone();
+        let announce_ep_resets = endpoint_reset_count.clone();
+        let announce_endpoint = shared_endpoint.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
                 let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let last_notif = announce_last_notif.load(Ordering::Relaxed);
+                let neighbor_list: Vec<String> =
+                    announce_neighbor_ids.read().unwrap().iter().cloned().collect();
+                let ep = announce_endpoint.read().await.clone();
+                let (direct, relayed) = classify_neighbor_paths(&ep, &neighbor_list).await;
                 let metrics = AnnounceMetrics {
                     neighbor_count: Some(announce_neighbors.load(Ordering::Relaxed)),
-                    neighbors: Some(announce_neighbor_ids.read().unwrap().iter().cloned().collect()),
+                    neighbors: Some(neighbor_list),
                     uptime_secs: Some(start_instant.elapsed().as_secs()),
                     msgs_received: Some(announce_recv.load(Ordering::Relaxed)),
                     msgs_sent: Some(announce_sent.load(Ordering::Relaxed)),
                     last_msg_age_secs: Some(now_secs.saturating_sub(last_notif)),
                     reconnect_count: Some(announce_reconnects.load(Ordering::Relaxed)),
+                    endpoint_resets: Some(announce_ep_resets.load(Ordering::Relaxed)),
+                    neighbors_direct: Some(direct),
+                    neighbors_relayed: Some(relayed),
                 };
                 let announce = PeerAnnounce::new(
                     &announce_node_id,
@@ -1778,6 +1868,80 @@ async fn join_peers_timeout(
     }
 }
 
+/// A peer's display name plus when we last heard an announce naming it.
+/// Entries silent for longer than PEER_NAME_TTL_SECS are aged out so ephemeral
+/// node identities (e.g. containers without a persistent key) don't accumulate.
+pub struct PeerNameEntry {
+    pub name: String,
+    pub last_seen: u64,
+}
+
+const PEER_NAME_TTL_SECS: u64 = 3600;
+
+/// Drop peer-name entries not refreshed within PEER_NAME_TTL_SECS. Returns how many were removed.
+fn prune_stale_peer_names(names: &mut HashMap<String, PeerNameEntry>, now: u64) -> usize {
+    let before = names.len();
+    names.retain(|_, e| now.saturating_sub(e.last_seen) <= PEER_NAME_TTL_SECS);
+    before - names.len()
+}
+
+/// Insert or refresh a peer name, updating last_seen. Returns true when the
+/// name is new or changed.
+fn upsert_peer_name(names: &mut HashMap<String, PeerNameEntry>, key: &str, name: &str, now: u64) -> bool {
+    let changed = names.get(key).is_none_or(|e| e.name != name);
+    names.insert(key.to_string(), PeerNameEntry { name: name.to_string(), last_seen: now });
+    changed
+}
+
+/// LRU update of the known-peers list: a re-sighted peer moves to the end, a new
+/// peer appends (evicting from the front over `max`). Returns Some((list, is_new))
+/// when the file needs rewriting, None when nothing changed.
+fn update_known_peers_list(mut peers: Vec<String>, node_str: &str, max: usize) -> Option<(Vec<String>, bool)> {
+    match peers.iter().position(|p| p == node_str) {
+        Some(pos) if pos == peers.len() - 1 => None,
+        Some(pos) => {
+            let entry = peers.remove(pos);
+            peers.push(entry);
+            Some((peers, false))
+        }
+        None => {
+            peers.push(node_str.to_string());
+            if peers.len() > max {
+                let drain_count = peers.len() - max;
+                peers.drain(..drain_count);
+            }
+            Some((peers, true))
+        }
+    }
+}
+
+/// Deterministically derive an ed25519 node key from an operator-secret seed and
+/// a per-instance discriminator (domain-separated SHA-512, first 32 bytes).
+fn derive_key_from_seed(seed: &str, discriminator: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha512::new();
+    hasher.update(b"podping-gossip-node-key-v1");
+    hasher.update([0u8]);
+    hasher.update(seed.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(discriminator.as_bytes());
+    hasher.finalize()[..32].try_into().unwrap()
+}
+
+/// Pick the key discriminator: explicit env override, then $HOSTNAME, then the
+/// kernel hostname; empty strings are treated as unset.
+fn choose_discriminator(
+    explicit: Option<String>,
+    hostname_env: Option<String>,
+    proc_hostname: Option<String>,
+) -> Option<String> {
+    [explicit, hostname_env, proc_hostname]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+}
+
 // Save a peer's NodeId to the known-peers file if it's not already present
 // and not our own node ID. Caps the file at MAX_KNOWN_PEERS entries,
 // evicting the oldest (first) entries when full.
@@ -1788,24 +1952,18 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
         return;
     }
     let node_str = node_id.to_string();
-    let mut peers: Vec<String> = fs::read_to_string(path)
+    let peers: Vec<String> = fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
 
-    if peers.iter().any(|l| l == &node_str) {
+    // LRU: re-sighted peers move to the end so churn from ephemeral nodes
+    // can't evict stable peers from the front of the file.
+    let Some((peers, is_new)) = update_known_peers_list(peers, &node_str, MAX_KNOWN_PEERS) else {
         return;
-    }
-
-    peers.push(node_str.clone());
-
-    // Evict oldest entries if over the cap
-    if peers.len() > MAX_KNOWN_PEERS {
-        let drain_count = peers.len() - MAX_KNOWN_PEERS;
-        peers.drain(..drain_count);
-    }
+    };
 
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -1816,7 +1974,9 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
         for p in &peers {
             let _ = writeln!(f, "{}", p);
         }
-        println!("  Saved new peer to {}: {}", path, node_str);
+        if is_new {
+            println!("  Saved new peer to {}: {}", path, node_str);
+        }
     }
 }
 
@@ -1858,7 +2018,7 @@ fn spawn_receive_task(
     trusted_publishers_file: String,
     auto_trust_endorsements: bool,
     last_notification_time: Arc<AtomicU64>,
-    peer_names: Arc<RwLock<HashMap<String, String>>>,
+    peer_names: Arc<RwLock<HashMap<String, PeerNameEntry>>>,
     reconnect_failures: Arc<AtomicU64>,
     reconnect_requested: Arc<AtomicBool>,
     reconnect_notify: Arc<Notify>,
@@ -1964,6 +2124,10 @@ fn spawn_receive_task(
                                     if let Some(tx) = announce.msgs_sent { s.push_str(&format!(" tx={}", tx)); }
                                     if let Some(age) = announce.last_msg_age_secs { s.push_str(&format!(" age={}s", age)); }
                                     if let Some(rc) = announce.reconnect_count { s.push_str(&format!(" reconn={}", rc)); }
+                                    if let Some(wd) = announce.watchdog_restarts { s.push_str(&format!(" wd={}", wd)); }
+                                    if let Some(ep) = announce.endpoint_resets { s.push_str(&format!(" ep={}", ep)); }
+                                    if let (Some(d), Some(r)) = (announce.neighbors_direct, announce.neighbors_relayed) { s.push_str(&format!(" d/r={}/{}", d, r)); }
+                                    if let Some(ref iv) = announce.iroh_version { s.push_str(&format!(" iroh={}", iv)); }
                                     if let Some(ref os) = announce.os { s.push_str(&format!(" {}", os)); }
                                     if let Some(ref arch) = announce.arch { s.push_str(&format!("/{}", arch)); }
                                     if let Some(ref bt) = announce.build_type { s.push_str(&format!("/{}", bt)); }
@@ -1977,13 +2141,22 @@ fn spawn_receive_task(
                                     "\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}{}\x1b[0m",
                                     name, announce.node_id, announce.version, metrics_str
                                 );
-                                let mut names = peer_names.write().unwrap();
-                                names.insert(announce.node_id.clone(), name.clone());
                             } else {
                                 println!(
                                     "\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}{}\x1b[0m",
                                     announce.node_id, announce.version, metrics_str
                                 );
+                            }
+                            {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                let mut names = peer_names.write().unwrap();
+                                let pruned = prune_stale_peer_names(&mut names, now);
+                                if let Some(ref name) = announce.friendly_name {
+                                    upsert_peer_name(&mut names, &announce.node_id, name, now);
+                                }
+                                if pruned > 0 {
+                                    println!("\x1b[36m[PEERS] Aged out {} peer(s) not heard from in {}s\x1b[0m", pruned, PEER_NAME_TTL_SECS);
+                                }
                             }
                             if let Ok(node_id) = announce.node_id.parse() {
                                 save_peer_if_new(&peers_file, &node_id, &my_node_id);
@@ -2082,7 +2255,7 @@ fn spawn_receive_task(
                     let display = {
                         let names = peer_names.read().unwrap();
                         match names.get(&node_str) {
-                            Some(name) => format!("\"{}\" ({})", name, node_id),
+                            Some(entry) => format!("\"{}\" ({})", entry.name, node_id),
                             None => node_str,
                         }
                     };
@@ -2096,7 +2269,7 @@ fn spawn_receive_task(
                     let display = {
                         let names = peer_names.read().unwrap();
                         match names.get(&node_str) {
-                            Some(name) => format!("\"{}\" ({})", name, node_id),
+                            Some(entry) => format!("\"{}\" ({})", entry.name, node_id),
                             None => node_str,
                         }
                     };
@@ -2146,10 +2319,119 @@ mod tests {
     }
 
     #[test]
+    fn announce_publishes_watchdog_and_iroh_diagnostics() {
+        let a = PeerAnnounce::new("node", "0.0.0", None, AnnounceMetrics::default());
+        assert_eq!(a.watchdog_restarts, Some(0));
+        let iroh = a.iroh_version.expect("iroh_version should be set at build time");
+        assert!(iroh.starts_with(|c: char| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn announce_carries_endpoint_resets_and_path_counts_from_metrics() {
+        let m = AnnounceMetrics {
+            endpoint_resets: Some(3),
+            neighbors_direct: Some(4),
+            neighbors_relayed: Some(1),
+            ..Default::default()
+        };
+        let a = PeerAnnounce::new("node", "0.0.0", None, m);
+        assert_eq!(a.endpoint_resets, Some(3));
+        assert_eq!(a.neighbors_direct, Some(4));
+        assert_eq!(a.neighbors_relayed, Some(1));
+    }
+
+    #[test]
+    fn announce_json_without_diagnostic_fields_still_deserializes() {
+        // Announces from pre-0.15 nodes must keep parsing on a mixed-version mesh
+        let json = r#"{"type":"peer_announce","node_id":"n","version":"0.14.0","timestamp":1}"#;
+        let a: PeerAnnounce = serde_json::from_str(json).unwrap();
+        assert!(a.iroh_version.is_none());
+        assert!(a.watchdog_restarts.is_none());
+        assert!(a.endpoint_resets.is_none());
+        assert!(a.neighbors_direct.is_none());
+        assert!(a.neighbors_relayed.is_none());
+    }
+
+    #[test]
     fn announce_json_without_arch_still_deserializes() {
         // Announces from pre-arch nodes must keep parsing on a mixed-version mesh
         let json = r#"{"type":"peer_announce","node_id":"n","version":"0.12.0","timestamp":1}"#;
         let a: PeerAnnounce = serde_json::from_str(json).unwrap();
         assert!(a.arch.is_none());
+    }
+
+    #[test]
+    fn peer_name_older_than_ttl_is_pruned() {
+        let now = 100_000;
+        let mut names = HashMap::new();
+        names.insert("stale".to_string(), PeerNameEntry { name: "old".to_string(), last_seen: now - PEER_NAME_TTL_SECS - 1 });
+        names.insert("fresh".to_string(), PeerNameEntry { name: "new".to_string(), last_seen: now - 10 });
+        let removed = prune_stale_peer_names(&mut names, now);
+        assert_eq!(removed, 1);
+        assert!(!names.contains_key("stale"));
+        assert!(names.contains_key("fresh"));
+    }
+
+    #[test]
+    fn upsert_reports_new_or_changed_name() {
+        let mut names = HashMap::new();
+        assert!(upsert_peer_name(&mut names, "k", "alice", 100));
+        assert!(!upsert_peer_name(&mut names, "k", "alice", 200));
+        assert!(upsert_peer_name(&mut names, "k", "bob", 300));
+    }
+
+    #[test]
+    fn upsert_refreshes_last_seen_for_unchanged_name() {
+        let mut names = HashMap::new();
+        upsert_peer_name(&mut names, "k", "alice", 100);
+        upsert_peer_name(&mut names, "k", "alice", 500);
+        assert_eq!(names.get("k").unwrap().last_seen, 500);
+    }
+
+    #[test]
+    fn known_peer_resighting_moves_it_to_end_of_list() {
+        let peers = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (updated, is_new) = update_known_peers_list(peers, "a", 15).unwrap();
+        assert_eq!(updated, vec!["b", "c", "a"]);
+        assert!(!is_new);
+    }
+
+    #[test]
+    fn peer_already_at_end_needs_no_rewrite() {
+        let peers = vec!["a".to_string(), "b".to_string()];
+        assert!(update_known_peers_list(peers, "b", 15).is_none());
+    }
+
+    #[test]
+    fn new_peer_appends_and_evicts_oldest_over_cap() {
+        let peers = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (updated, is_new) = update_known_peers_list(peers, "d", 3).unwrap();
+        assert_eq!(updated, vec!["b", "c", "d"]);
+        assert!(is_new);
+    }
+
+    #[test]
+    fn seed_key_derivation_matches_pinned_vector() {
+        // Pinned so all three daemons provably derive identical keys from the
+        // same seed+discriminator, and the format never drifts silently.
+        let hex = |b: [u8; 32]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+        assert_eq!(
+            hex(derive_key_from_seed("test-seed", "node-a")),
+            "e896ec2ff9ea153eced64c4d9234feee16086baf4facfb7a24877093ba6ea633"
+        );
+        assert_eq!(
+            hex(derive_key_from_seed("test-seed", "node-b")),
+            "ad94bac53fa79991ae8afa61177df611700736dfedcfc69576e21bda49c8ccb9"
+        );
+    }
+
+    #[test]
+    fn discriminator_prefers_explicit_then_hostname_and_ignores_empty() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(choose_discriminator(s("x"), s("h"), s("p")), s("x"));
+        assert_eq!(choose_discriminator(None, s("h"), s("p")), s("h"));
+        assert_eq!(choose_discriminator(None, None, s("p")), s("p"));
+        assert_eq!(choose_discriminator(s(""), s(""), s("p")), s("p"));
+        assert_eq!(choose_discriminator(None, None, None), None);
     }
 }

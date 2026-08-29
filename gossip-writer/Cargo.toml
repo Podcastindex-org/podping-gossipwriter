@@ -1,6 +1,6 @@
 [package]
 name = "gossip-writer"
-version = "0.14.0"
+version = "0.15.0"
 authors = ["Dave Jones"]
 edition = "2021"
 build = "build.rs"
@@ -25,6 +25,7 @@ futures-lite = "2"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 blake3 = "1"
 rand = "0.9"
+sha2 = "0.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -43,5 +44,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 libc = "0.2"
 
-[dev-dependencies]
-sha2 = "0.10"
